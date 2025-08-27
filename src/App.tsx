@@ -14,7 +14,7 @@ export default function App() {
         {/* <MaskedImageNoise src="image.jpg" scale={toScale} shiftYPercent={toY} />
          */}
         <MaskedImageCursorDeform
-          src="/image.jpg" // <-- твоя картинка (из public или импортом)
+          src="./image.jpg" // <-- твоя картинка (из public или импортом)
           scale={toScale} // чтобы совпадало с прелоадером
           shiftYPercent={toY}
           radius={300} // радиус влияния курсора

@@ -1,19 +1,26 @@
 // MaskedImageCursorDeform.tsx
+// Мягкое «дыхание» маски (SimplexNoise по кольцу) + плавное смещение всей маски за курсором.
+
 import { useEffect, useMemo, useRef } from "react";
 import { spline } from "@georgedoescode/spline";
+import SimplexNoise from "simplex-noise";
 import { PATH_D } from "./Silhouette";
 
 type Props = {
   src: string;
-  scale?: number; // как в прелоадере (примерно 1.1)
-  shiftYPercent?: number; // как в прелоадере (примерно 12)
-  samples?: number; // сколько точек по периметру (качество/нагрузка)
-  radius?: number; // радиус влияния курсора (в координатах viewBox 2309x1877)
-  strength?: number; // 0..1 — насколько сильно тянем точки к курсору
-  debug?: boolean; // показать розовый контур-оверлей
+  scale?: number; // ~1.1
+  shiftYPercent?: number; // ~12
+  samples?: number; // кол-во точек контура
+  noiseAmplitude?: number; // амплитуда «дыхания» в px
+  noiseSpeed?: number; // скорость анимации нойза (0.0003..0.001)
+  shapeLerp?: number; // временное сглаживание формы (0..1), меньше = нежнее
+  spatialSmoothPasses?: number; // кол-во проходов сглаживания по контуру (0..2)
+  moveRangePx?: number; // макс. смещение маски курсором
+  moveLerp?: number; // сглаживание движения маски (0..1)
+  debug?: boolean;
 };
 
-// фиксированная система координат — та же, что в прелоадере
+// Фиксированный viewBox как в прелоадере
 const VBW = 2309;
 const VBH = 1877;
 const VBCX = VBW / 2;
@@ -26,158 +33,206 @@ export default function MaskedImageCursorDeform({
   scale = 1.1,
   shiftYPercent = 12,
   samples = 220,
-  radius = 260,
-  strength = 0.25,
+  noiseAmplitude = 12,
+  noiseSpeed = 0.0005,
+  shapeLerp = 0.08,
+  spatialSmoothPasses = 1,
+  moveRangePx = 40,
+  moveLerp = 0.1,
   debug = false,
 }: Props) {
   const clipId = useMemo(
     () => "clip_" + Math.random().toString(36).slice(2),
     []
   );
-  const pathRef = useRef<SVGPathElement>(null); // текущий деформированный путь (в клипе)
-  const debugPathRef = useRef<SVGPathElement>(null); // розовый контур (опционально)
-  const clipRef = useRef<SVGClipPathElement>(null); // чтобы повесить transform (scale+shift)
-  const restPtsRef = useRef<Pt[]>([]); // исходные точки по периметру (в coords PATH_D)
-  const haveMouse = useRef(false);
 
-  // 1) Семплим исходный путь в точки (один раз)
+  const svgRef = useRef<SVGSVGElement>(null);
+  const pathRef = useRef<SVGPathElement>(null);
+  const debugPathRef = useRef<SVGPathElement>(null);
+  const clipRef = useRef<SVGClipPathElement>(null);
+
+  const basePtsRef = useRef<Pt[]>([]);
+  const prevPtsRef = useRef<Pt[]>([]);
+  const rafRef = useRef<number | null>(null);
+
+  // целевое смещение маски ([-1..1] от центра), и сглаженное смещение (в пикселях)
+  const mouseTargetRef = useRef<{ nx: number; ny: number }>({ nx: 0, ny: 0 });
+  const mouseSmoothRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
+
+  // --- utils ---
+  const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+
+  const smoothCircular = (pts: Pt[], passes: number): Pt[] => {
+    if (passes <= 0) return pts;
+    const kernel = [0.25, 0.5, 0.25]; // лёгкое ядро
+    const n = pts.length;
+    let cur = pts;
+    for (let p = 0; p < passes; p++) {
+      const out = new Array<Pt>(n);
+      for (let i = 0; i < n; i++) {
+        const i0 = (i - 1 + n) % n;
+        const i1 = i;
+        const i2 = (i + 1) % n;
+        out[i] = {
+          x:
+            cur[i0].x * kernel[0] +
+            cur[i1].x * kernel[1] +
+            cur[i2].x * kernel[2],
+          y:
+            cur[i0].y * kernel[0] +
+            cur[i1].y * kernel[1] +
+            cur[i2].y * kernel[2],
+        };
+      }
+      cur = out;
+    }
+    return cur;
+  };
+
+  // 1) Семплируем базовый PATH_D в точки
   useEffect(() => {
-    // создаём временный path, чтобы воспользоваться getTotalLength()
-    const p = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    p.setAttribute("d", PATH_D);
+    const tmp = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    tmp.setAttribute("d", PATH_D);
 
-    const total = p.getTotalLength();
+    const total = tmp.getTotalLength();
     const pts: Pt[] = [];
     for (let i = 0; i < samples; i++) {
       const l = (i / samples) * total;
-      const { x, y } = p.getPointAtLength(l);
+      const { x, y } = tmp.getPointAtLength(l);
       pts.push({ x, y });
     }
-    restPtsRef.current = pts;
-  }, [samples]);
+    basePtsRef.current = pts;
+    prevPtsRef.current = pts.map((p) => ({ ...p }));
 
-  // 2) Вешаем transform на сам clipPath (как в рабочем варианте А)
-  useEffect(() => {
-    const shiftPx = (shiftYPercent / 100) * VBH;
-    clipRef.current?.setAttribute(
-      "transform",
-      `translate(${VBCX},${VBCY}) translate(0,${shiftPx}) scale(${scale}) translate(${-VBCX},${-VBCY})`
-    );
-  }, [scale, shiftYPercent]);
-
-  // 3) Обработчики курсора — деформация только при движении внутри SVG
-  useEffect(() => {
-    const svg = pathRef.current?.ownerSVGElement;
-    if (!svg || !pathRef.current) return;
-
-    const toViewBox = (evt: PointerEvent) => {
-      const r = svg.getBoundingClientRect();
-      // координаты курсора в системе viewBox (2309x1877)
-      const x = ((evt.clientX - r.left) / r.width) * VBW;
-      const y = ((evt.clientY - r.top) / r.height) * VBH;
-      return { x, y };
-    };
-
-    const inverseTransform = (vx: number, vy: number) => {
-      // у нас клип смещён/масштабирован:
-      // M = T(VBC) * Ty(shift) * S(scale) * T(-VBC)
-      // инвертируем: T(VBC) * S(1/scale) * Ty(-shift) * T(-VBC)
-      const shiftPx = (shiftYPercent / 100) * VBH;
-      // в «центрированные» координаты:
-      let x = vx - VBCX;
-      let y = vy - VBCY;
-      // убираем сдвиг по Y:
-      y -= shiftPx;
-      // убираем масштаб:
-      x /= scale;
-      y /= scale;
-      // возвращаем из центра
-      x += VBCX;
-      y += VBCY;
-      return { x, y };
-    };
-
-    const deformOnce = (evt: PointerEvent) => {
-      const pth = pathRef.current!;
-      const dbg = debugPathRef.current;
-
-      const { x: vx, y: vy } = toViewBox(evt); // курсор в координатах viewBox
-      const { x: cx, y: cy } = inverseTransform(vx, vy); // приводим к «исходным» coords PATH_D
-
-      const base = restPtsRef.current;
-      if (!base.length) return;
-
-      const r2 = radius * radius;
-      const pulled: Pt[] = new Array(base.length);
-
-      for (let i = 0; i < base.length; i++) {
-        const p0 = base[i];
-        const dx = cx - p0.x;
-        const dy = cy - p0.y;
-        const d2 = dx * dx + dy * dy;
-
-        if (d2 > r2) {
-          pulled[i] = p0;
-        } else {
-          const d = Math.sqrt(d2);
-          const nx = dx / (d || 1); // нормализованный вектор от курсора
-          const ny = dy / (d || 1);
-
-          // вес: максимум под курсором, плавное затухание
-          //   const w = Math.exp(-d2 / (2 * r2));
-
-          // глубина прогиба: тем больше, чем ближе к центру
-          const depth = strength * (1 - d / radius) ** 2 * 10;
-
-          pulled[i] = {
-            x: p0.x + nx * depth * 40, // 40 = масштаб пикселей (подбери под вкус)
-            y: p0.y + ny * depth * 40,
-          };
-        }
-      }
-
-      const d = spline(pulled, 1, true);
-      pth.setAttribute("d", d);
-      if (debug && dbg) dbg.setAttribute("d", d);
-    };
-
-    const onEnter = () => {
-      haveMouse.current = true;
-      // при входе — сбрасываем в исходную форму
-      const d0 = spline(restPtsRef.current, 1, true);
-      pathRef.current!.setAttribute("d", d0);
-      if (debug && debugPathRef.current)
-        debugPathRef.current.setAttribute("d", d0);
-    };
-    const onMove = (e: PointerEvent) => {
-      if (!haveMouse.current) return;
-      deformOnce(e);
-    };
-    const onLeave = () => {
-      haveMouse.current = false;
-      // вернуть исходную форму
-      const d0 = spline(restPtsRef.current, 1, true);
-      pathRef.current!.setAttribute("d", d0);
-      if (debug && debugPathRef.current)
-        debugPathRef.current.setAttribute("d", d0);
-    };
-
-    svg.addEventListener("pointerenter", onEnter);
-    svg.addEventListener("pointermove", onMove);
-    svg.addEventListener("pointerleave", onLeave);
-
-    // начальный d = исходный (на случай, если курсора нет)
-    const d0 = spline(restPtsRef.current, 1, true);
-    pathRef.current!.setAttribute("d", d0);
+    const d0 = spline(pts, 1, true);
+    pathRef.current?.setAttribute("d", d0);
     if (debug && debugPathRef.current)
       debugPathRef.current.setAttribute("d", d0);
+  }, [samples, debug]);
+
+  // 2) Движение курсора: целевое смещение от центра
+  useEffect(() => {
+    const el = svgRef.current;
+    if (!el) return;
+
+    const onMove = (e: PointerEvent) => {
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const nx = (e.clientX - cx) / (r.width / 2) || 0;
+      const ny = (e.clientY - cy) / (r.height / 2) || 0;
+      mouseTargetRef.current.nx = Math.max(-1, Math.min(1, nx));
+      mouseTargetRef.current.ny = Math.max(-1, Math.min(1, ny));
+    };
+
+    const resetToCenter = () => {
+      mouseTargetRef.current.nx = 0;
+      mouseTargetRef.current.ny = 0;
+    };
+
+    el.addEventListener("pointermove", onMove);
+    el.addEventListener("pointerleave", resetToCenter);
+    el.addEventListener("pointercancel", resetToCenter);
 
     return () => {
-      svg.removeEventListener("pointerenter", onEnter);
-      svg.removeEventListener("pointermove", onMove);
-      svg.removeEventListener("pointerleave", onLeave);
+      el.removeEventListener("pointermove", onMove);
+      el.removeEventListener("pointerleave", resetToCenter);
+      el.removeEventListener("pointercancel", resetToCenter);
     };
-  }, [scale, shiftYPercent, radius, strength, debug]);
+  }, []);
+
+  // 3) Анимация: мягкий кольцевой нойз + плавный сдвиг маски
+  useEffect(() => {
+    const noise = new SimplexNoise();
+
+    const tick = (tMs: number) => {
+      const t = tMs * noiseSpeed;
+
+      // сглаживаем смещение маски к цели
+      const target = mouseTargetRef.current;
+      const cur = mouseSmoothRef.current;
+      const tx = target.nx * moveRangePx;
+      const ty = target.ny * moveRangePx;
+      cur.x = lerp(cur.x, tx, moveLerp);
+      cur.y = lerp(cur.y, ty, moveLerp);
+
+      // transform для clipPath: курсорный translate -> центр/shift/scale
+      const shiftPx = (shiftYPercent / 100) * VBH;
+      if (clipRef.current) {
+        clipRef.current.setAttribute(
+          "transform",
+          `translate(${cur.x},${cur.y}) ` +
+            `translate(${VBCX},${VBCY}) translate(0,${shiftPx}) ` +
+            `scale(${scale}) translate(${-VBCX},${-VBCY})`
+        );
+      }
+
+      // --- МЯГКИЙ КОНТУР ---
+      // 1) «Кольцевой» нойз: берем фазу по окружности, чтобы вдоль контура было гладко
+      const base = basePtsRef.current;
+      const nPts = base.length;
+      const targetPts: Pt[] = new Array(nPts);
+
+      for (let i = 0; i < nPts; i++) {
+        const p0 = base[i];
+        // нормаль наружу от центра
+        const vx = p0.x - VBCX;
+        const vy = p0.y - VBCY;
+        const len = Math.hypot(vx, vy) || 1;
+        const nx = vx / len;
+        const ny = vy / len;
+
+        // угол точки на «кольце»
+        const ang = (i / nPts) * Math.PI * 2;
+
+        // шум вдоль окружности + время — очень плавный, без рваных переходов по индексу
+        const n = noise.noise2D(Math.cos(ang) + t, Math.sin(ang) - t); // [-1..1]
+        const offs = n * noiseAmplitude;
+
+        targetPts[i] = { x: p0.x + nx * offs, y: p0.y + ny * offs };
+      }
+
+      // 2) Пространственное сглаживание контура (по желанию)
+      const spatial =
+        spatialSmoothPasses > 0
+          ? smoothCircular(targetPts, spatialSmoothPasses)
+          : targetPts;
+
+      // 3) Временное сглаживание (пер-пойнтовый low-pass к предыдущей форме)
+      const prev = prevPtsRef.current;
+      const out: Pt[] = new Array(nPts);
+      for (let i = 0; i < nPts; i++) {
+        out[i] = {
+          x: lerp(prev[i].x, spatial[i].x, shapeLerp),
+          y: lerp(prev[i].y, spatial[i].y, shapeLerp),
+        };
+      }
+      prevPtsRef.current = out;
+
+      const d = spline(out, 1, true);
+      pathRef.current?.setAttribute("d", d);
+      if (debug && debugPathRef.current)
+        debugPathRef.current.setAttribute("d", d);
+
+      rafRef.current = requestAnimationFrame(tick);
+    };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [
+    scale,
+    shiftYPercent,
+    noiseAmplitude,
+    noiseSpeed,
+    shapeLerp,
+    spatialSmoothPasses,
+    moveRangePx,
+    moveLerp,
+    debug,
+  ]);
 
   return (
     <div
@@ -188,6 +243,7 @@ export default function MaskedImageCursorDeform({
         overflow: "hidden",
       }}>
       <svg
+        ref={svgRef}
         viewBox={`0 0 ${VBW} ${VBH}`}
         preserveAspectRatio="xMidYMid slice"
         style={{
@@ -198,20 +254,19 @@ export default function MaskedImageCursorDeform({
           display: "block",
         }}>
         <defs>
-          {/* КЛЮЧ: transform вешаем прямо на clipPath (это рабочий кейс у тебя) */}
+          {/* transform вешаем на clipPath: scale/shift + курсорный сдвиг */}
           <clipPath id={clipId} clipPathUnits="userSpaceOnUse" ref={clipRef}>
             <path ref={pathRef} d="" fill="white" />
           </clipPath>
         </defs>
 
-        {/* бежевый фон вокруг маски */}
+        {/* фон вокруг маски */}
         <rect x="0" y="0" width={VBW} height={VBH} fill="#F6EEDD" />
 
-        {/* картинка, режем клипом */}
+        {/* изображение, обрезанное маской */}
         <g clipPath={`url(#${clipId})`}>
           <image
             href={src}
-            xlinkHref={src as string}
             x="0"
             y="0"
             width={VBW}
