@@ -1,0 +1,26 @@
+.masked-clip {
+  position: relative;
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+  z-index: 2;
+  pointer-events: none;
+}
+
+.masked-clip__svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  transition: transform ease-in-out 1.8s, opacity ease-in-out 0.3s;
+  opacity: 0;
+}
+
+.masked-clip__svg--active {
+  opacity: 1;
+}
+
+.masked-clip__fill {
+  fill: #c9c6bb;
+}

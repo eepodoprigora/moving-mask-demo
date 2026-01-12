@@ -1,0 +1,1 @@
+export { MaskedClipCursorDeform } from './MaskedClipCursorDeform';

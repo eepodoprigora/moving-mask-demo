@@ -1,0 +1,42 @@
+.counter-wrapper {
+  overflow: hidden;
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 10;
+}
+
+.odometer {
+  display: flex;
+  transition: transform 0.6s ease-in-out;
+  color: #000;
+
+  .digits-finish & {
+    transition-delay: 0.6s;
+    transform: translateY(-100%);
+  }
+}
+
+.odometer__digit {
+  position: relative;
+  width: 0.7em;
+  height: 0.9em;
+  overflow: hidden;
+  font-size: 50px;
+}
+
+.odometer__glyph {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  text-align: center;
+  line-height: 0.9em;
+  will-change: transform;
+}
+
+.odometer__suffix {
+  width: 1em;
+  line-height: 0.9em;
+  font-size: 50px;
+}

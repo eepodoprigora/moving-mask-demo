@@ -1,29 +1,10 @@
-.mask-wrapper {
-  position: fixed;
-  inset: 0;
-  background: transparent; // фон рисует сам rect в SVG
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  pointer-events: none; // чтобы не мешал кликам
-  z-index: 10;
-}
+@import "@/components/Preloader/Preloader.scss";
+@import "@/components/Counter/Counter.scss";
+@import "@/components/Hero/Hero.scss";
+@import "@/components/MaskedClipCursorDeform/MaskedClipCursorDeform.scss";
 
-.mask-svg {
+.main {
   width: 100vw;
   height: 100vh;
-}
-
-.first-block {
   position: relative;
-  width: 100%;
-  height: 100vh;
-  overflow: hidden;
-}
-
-.first-image {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  display: block;
 }

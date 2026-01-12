@@ -1,0 +1,1 @@
+export { PreloaderSilhouette } from './PreloaderSilhouette'

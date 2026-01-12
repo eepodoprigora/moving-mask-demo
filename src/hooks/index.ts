@@ -1,0 +1,1 @@
+export { type MaskOptions, usePreloaderSimplexMask } from './use-preloader-simplex-mask'
